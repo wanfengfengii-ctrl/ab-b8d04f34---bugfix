@@ -157,7 +157,7 @@ export function createServer({ dataDir, maxUploadBytes }) {
   }
 
   async function handleReleaseArtifact(req, res, version) {
-    const meta = store.get(version);
+    const meta = await store.findRelease(version);
     if (!meta || !VERSION_RE.test(version)) {
       sendError(res, 404, 'RELEASE_NOT_FOUND', `版本 ${version} 不存在`);
       return;
@@ -166,12 +166,27 @@ export function createServer({ dataDir, maxUploadBytes }) {
   }
 
   async function handleActiveArtifact(req, res, targetModel) {
-    // 仅解析一次不可变发布件元数据：整个响应（头与字节）都锁定在该版本，
-    // 即便响应期间活动版本被切换，设备拿到的仍是最后一次成功切换时的完整发布件。
-    const meta = store.getActiveMeta(targetModel);
+    // 多实例共用 DATA_DIR：活动映射的权威副本在共享磁盘上。每次稳定取件都
+    // 重读映射并刷新本实例缓存，使竞争落败/主备切换后的实例立即收敛到唯一获胜版本，
+    // 而不是继续下发自己先前看到的旧活动版本。
+    // 随后只解析一次该不可变发布件元数据：整个响应（头与字节）都锁定在这一版本，
+    // 即便响应期间活动版本再次被切换，设备拿到的仍是单一完整发布件。
+    let meta;
+    try {
+      const rec = await store.refreshActiveFromDisk(targetModel);
+      if (!rec) {
+        sendError(res, 404, 'ACTIVE_RELEASE_NOT_FOUND',
+          `型号 ${targetModel} 尚无活动固件`);
+        return;
+      }
+      meta = store.get(rec.version);
+    } catch (err) {
+      sendError(res, 500, 'INTERNAL_ERROR', `读取活动固件映射失败: ${err.message}`);
+      return;
+    }
     if (!meta) {
       sendError(res, 404, 'ACTIVE_RELEASE_NOT_FOUND',
-        `型号 ${targetModel} 尚无活动固件`);
+        `型号 ${targetModel} 的活动发布件缺失`);
       return;
     }
     await serveArtifact(req, res, meta);

@@ -42,9 +42,13 @@
 3. ETag 即发布字节的 SHA-256；下载前校验磁盘文件大小与元数据一致。
 4. 已发布数据位于持久卷 `/data`，重启后自动加载；崩溃残留的暂存目录/临时映射启动时清理。
 5. 活动映射（型号 → 版本）只持有指向不可变发布件的指针，以原子 `rename` 落盘到
-   `active/` 并在切换临界区内更新；切换按型号串行，`expectedVersion` 乐观校验保证
-   并发竞争恰有一个成功。设备下载在请求开始即锁定单一版本元数据，
-   故任一字节及其校验头都来自同一发布件，切换不改变进行中的响应。
+   `active/` 并在切换临界区内更新；切换在进程内按型号串行，并在共享 `DATA_DIR` 上以
+   `O_EXCL` 锁文件做**跨进程互斥**：同一旧版本上的竞争（含分属不同实例的两个请求）
+   恰有一个 CAS 成功，败者得到 `409 VERSION_CONFLICT` 且活动版本不变。锁文件带实例令牌，
+   仅在判定为持锁进程崩溃的陈旧锁（默认 10s）时接管。
+6. 稳定取件地址每次请求都以**共享磁盘上的活动映射为准**重读并刷新本实例缓存，
+   故竞争落败或刚完成主备切换的实例会立即收敛到唯一获胜版本；随后整次响应（头与字节）
+   锁定在该单一不可变发布件上，切换不改变进行中的响应，也不会跨版本拼接。
 
 ## 目录结构
 
@@ -54,12 +58,12 @@ src/
   multipart.js  零依赖流式 multipart/form-data 解析（背压、限额、临时文件清理）
   range.js      RFC 7233 单区间与 If-Range 解析
   store.js      原子发布、摘要校验、持久化元数据与型号活动映射
-test/           node:test 单元 + HTTP 集成测试（60 项）
+test/           node:test 单元 + HTTP 集成测试（含双进程共享 DATA_DIR 跨实例竞争回归，73 项）
 scripts/
-  smoke.mjs     发布分段重组 + 活动切换/稳定地址 API 冒烟
+  smoke.mjs     发布分段重组 + 活动切换/稳定地址 API 冒烟（设 PEER_URL 时追加双实例竞争与收敛校验）
   verify.sh     verify 一次性服务入口
 Dockerfile      可构建应用镜像
-docker-compose.yml  健康检查 + 持久卷 + 可配置宿主机端口 + verify 一次性服务
+docker-compose.yml  健康检查 + 持久卷 + 双对等实例 + 可配置宿主机端口 + verify 一次性服务
 ```
 
 ## 本地运行（无需安装依赖）
@@ -85,9 +89,14 @@ docker compose run --rm verify
 ```
 
 - 持久卷：命名卷 `firmware-data` 挂载到 `/data`。
+- 双对等实例：`app`（默认宿主机端口 8080，`HOST_PORT` 可配）与 `app2`
+  （默认 8081，`HOST_PORT2` 可配）共享同一命名卷；活动切换的跨进程 CAS 与
+  稳定地址的跨实例收敛由应用层保证，两实例间不做复制，只以共享磁盘上的映射为权威状态。
 - 健康检查：容器内用 Node 内置 `fetch` 探测 `/healthz`（镜像不含 curl/wget）。
-- verify 服务 `depends_on: app (service_healthy)`，依次执行：
-  代码测试（`node --test`）→ 构建检查（`node --check`）→ 分段重组 API 冒烟，并以退出码报告。
+- verify 服务同时等待两个实例健康（`depends_on: app/app2 (service_healthy)`），依次执行：
+  代码测试（`node --test`，含 `active-xproc.test.js` 双进程共享 DATA_DIR 竞争回归）→
+  构建检查（`node --check`）→ 对 `app` 与 `app2` 的分段重组/活动切换/跨实例竞争冒烟，
+  并以退出码报告。
 
 ## 使用示例
 
@@ -124,4 +133,6 @@ curl -f http://localhost:8080/api/firmware/models/WT-5000/artifact -o fw-active.
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `DATA_DIR` | `/data` | 发布数据与临时文件目录 |
 | `MAX_UPLOAD_BYTES` | `41943040`（40MiB） | 单次上传体积上限 |
-| `HOST_PORT`（compose） | `8080` | 宿主机映射端口 |
+| `HOST_PORT`（compose） | `8080` | `app` 宿主机映射端口 |
+| `HOST_PORT2`（compose） | `8081` | `app2`（第二对等实例）宿主机映射端口 |
+| `PEER_URL`（verify/冒烟） | 未设置 | 设置后冒烟追加针对该第二实例的跨实例竞争与收敛校验 |

@@ -16,17 +16,18 @@ function check(name, cond, detail = '') {
   }
 }
 
-async function waitHealthy(deadlineMs = 30_000) {
+async function waitHealthy(base = BASE, deadlineMs = 30_000) {
   const deadline = Date.now() + deadlineMs;
   for (;;) {
     try {
-      const r = await fetch(`${BASE}/healthz`);
+      const r = await fetch(`${base}/healthz`);
       if (r.ok) return;
     } catch { /* 尚未起来 */ }
-    if (Date.now() > deadline) throw new Error(`服务在 ${deadlineMs}ms 内未通过健康检查：${BASE}/healthz`);
+    if (Date.now() > deadline) throw new Error(`服务在 ${deadlineMs}ms 内未通过健康检查：${base}/healthz`);
     await new Promise((r) => setTimeout(r, 500));
   }
 }
+const waitHealthyAt = waitHealthy;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
@@ -306,6 +307,83 @@ async function main() {
   const list2 = await fetch(`${BASE}/api/firmware/releases`).then((r) => r.json());
   check('清单仍包含全部已发布版本', [vA, vB, vC, vD, vOther]
     .every((v) => list2.releases.some((x) => x.version === v)));
+
+  // ================= 双实例共享 DATA_DIR：跨实例竞争切换与收敛 =================
+  const PEER = process.env.PEER_URL;
+  if (PEER) {
+    console.log(`[smoke] 跨实例回归：APP=${BASE} PEER=${PEER}`);
+    await waitHealthyAt(PEER);
+
+    const xm = `WT-XINST-${stamp}`;
+    const xv = ['x0', 'x1', 'x2'].map((t) => `xinst-${t}-${stamp}`);
+    const xb = xv.map((v, i) => mkBuf(`xinst-${i}-${v}`, 120_000));
+    for (let i = 0; i < xv.length; i++) {
+      const r = await publishRaw(xv[i], xb[i], sha256(xb[i]), xm);
+      check(`跨实例：经 APP 发布 ${xv[i]}`, r.status === 201, `got ${r.status}`);
+    }
+    const xSwitch = (base, body) => fetch(`${base}/api/firmware/models/${encodeURIComponent(xm)}/active`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const xStable = (base) => `${base}/api/firmware/models/${encodeURIComponent(xm)}/artifact`;
+    const expectActive = async (base, buf, tag) => {
+      const g = await fetch(xStable(base));
+      const gb = Buffer.from(await g.arrayBuffer());
+      check(`${tag}：200 且 ETag/字节为获胜版本`,
+        g.status === 200 && g.headers.get('etag') === `"${sha256(buf)}"` && gb.equals(buf),
+        `status=${g.status} etag=${g.headers.get('etag')}`);
+    };
+
+    // 无竞争首次切换（APP），PEER 未参与过任何请求也必须从共享磁盘读到 v0
+    const first = await xSwitch(BASE, { releaseVersion: xv[0], expectedVersion: null });
+    check('跨实例：首次切换 200', first.status === 200, `got ${first.status}`);
+    await expectActive(PEER, xb[0], '跨实例：PEER 稳定地址');
+
+    // 双实例并发竞争：同一前置 v0，分别切 v1（APP）/v2（PEER）→ 恰一个 200
+    const race = await Promise.all([
+      xSwitch(BASE, { releaseVersion: xv[1], expectedVersion: xv[0] }),
+      xSwitch(PEER, { releaseVersion: xv[2], expectedVersion: xv[0] }),
+    ]);
+    const raceStatus = race.map((r) => r.status).sort((a, b) => a - b);
+    check('跨实例竞争：仅一个 200、一个 409 VERSION_CONFLICT',
+      raceStatus[0] === 200 && raceStatus[1] === 409
+      && (await race.find((r) => r.status === 409).json()).error.code === 'VERSION_CONFLICT',
+      `got ${raceStatus.join(',')}`);
+    const raceWinner = (await race.find((r) => r.status === 200).json()).activeVersion;
+    const winIdx = xv.indexOf(raceWinner);
+    check('跨实例竞争赢家为 v1/v2 之一', winIdx === 1 || winIdx === 2, `winner=${raceWinner}`);
+    const loseBuf = xb[winIdx === 1 ? 2 : 1];
+
+    // 竞争后无论请求落到哪个实例，稳定地址（含 Range/If-Range）都只给获胜版本
+    await expectActive(BASE, xb[winIdx], '跨实例：竞争后 APP');
+    await expectActive(PEER, xb[winIdx], '跨实例：竞争后 PEER');
+    for (const base of [BASE, PEER]) {
+      const tag = base === BASE ? 'APP' : 'PEER';
+      const pr = await fetch(xStable(base), { headers: { Range: 'bytes=10-2047' } });
+      const pbuf = Buffer.from(await pr.arrayBuffer());
+      check(`跨实例：${tag} Range 206 且字节/ETag 属于获胜版本`,
+        pr.status === 206
+        && pr.headers.get('content-range') === `bytes 10-2047/${xb[winIdx].length}`
+        && pr.headers.get('etag') === `"${sha256(xb[winIdx])}"`
+        && pbuf.equals(xb[winIdx].subarray(10, 2048)));
+      // 落败版本 ETag 作为 If-Range 必须回退完整获胜版本，不能拼出落败字节
+      const sr = await fetch(xStable(base), {
+        headers: { Range: 'bytes=0-99', 'If-Range': `"${sha256(loseBuf)}"` },
+      });
+      const sbuf = Buffer.from(await sr.arrayBuffer());
+      check(`跨实例：${tag} 落败版本 If-Range 回退完整获胜版本`,
+        sr.status === 200 && sbuf.equals(xb[winIdx])
+        && sr.headers.get('etag') === `"${sha256(xb[winIdx])}"`);
+    }
+
+    // 后续正常切换（以赢家为前置，经 PEER 发起），两实例立即一致
+    const nextIdx = winIdx === 1 ? 2 : 1;
+    const nxt = await xSwitch(PEER, { releaseVersion: xv[nextIdx], expectedVersion: xv[winIdx] });
+    check('跨实例：以获胜版本为前置的后续切换 200', nxt.status === 200, `got ${nxt.status}`);
+    await expectActive(BASE, xb[nextIdx], '跨实例：后续切换后 APP');
+    await expectActive(PEER, xb[nextIdx], '跨实例：后续切换后 PEER');
+  }
 
   console.log(failures === 0
     ? `[smoke] 全部通过 ✅ (${BASE})`

@@ -10,6 +10,7 @@ import {
 import {
   access,
   mkdir,
+  open,
   readdir,
   readFile,
   rename,
@@ -18,10 +19,16 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 
 const HEX64 = /^[a-f0-9]{64}$/i;
 export const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+
+// 跨进程活动切换锁参数。临界区只含几次毫秒级文件操作：
+// 锁文件存活超过该阈值只能说明持锁进程崩溃/被强杀，等待者可安全接管。
+const ACTIVE_LOCK_STALE_MS = 10_000;
+const ACTIVE_LOCK_WAIT_MS = 30_000;
 
 export class StoreError extends Error {
   constructor(message, status = 400, code = 'BAD_REQUEST') {
@@ -42,8 +49,12 @@ export class FirmwareStore {
     this.meta = new Map();
     /** @type {Map<string, any>} targetModel -> 活动记录 {version, switchedAt} */
     this.active = new Map();
-    /** @type {Map<string, Promise<unknown>>} 按型号串行化活动切换，杜绝并发竞争产生混合状态 */
+    /** @type {Map<string, Promise<unknown>>} 按型号串行化活动切换（进程内公平排队） */
     this.activeLocks = new Map();
+    /** 跨进程互斥锁令牌：{name, token}，未持锁为 null */
+    this.crossProcLock = null;
+    // 锁文件中标识持锁进程/实例，仅用于排障与存活时间判断
+    this.instanceId = `${os.hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
   async init() {
@@ -65,12 +76,7 @@ export class FirmwareStore {
     const rels = await readdir(this.releasesDir, { withFileTypes: true });
     for (const e of rels) {
       if (!e.isDirectory()) continue;
-      try {
-        const meta = JSON.parse(await readFile(path.join(this.releasesDir, e.name, 'meta.json'), 'utf8'));
-        if (!meta || meta.version !== e.name || !HEX64.test(meta.sha256 || '')) continue;
-        await access(path.join(this.releasesDir, e.name, 'artifact'));
-        this.meta.set(meta.version, Object.freeze({ ...meta }));
-      } catch { /* 残缺目录：忽略，不污染已发布视图 */ }
+      await this.#loadRelease(e.name);
     }
 
     // 载入型号 -> 活动版本映射。映射只指向不可变发布件：
@@ -79,27 +85,69 @@ export class FirmwareStore {
     try {
       actEntries = await readdir(this.activeDir, { withFileTypes: true });
     } catch { /* ignore */ }
-    // 清理崩溃残留的原子写临时文件
+    // 清理崩溃残留的原子写临时文件，以及上轮进程崩溃留下的陈旧切换锁
+    const now = Date.now();
     await Promise.all(
       actEntries
         .filter((e) => e.isFile() && e.name.includes('.tmp-'))
         .map((e) => rm(path.join(this.activeDir, e.name), { force: true }).catch(() => {})),
     );
+    const staleLock = actEntries.find((e) => e.isFile() && e.name === '.switch.lock');
+    if (staleLock) {
+      try {
+        const st = await stat(path.join(this.activeDir, '.switch.lock'));
+        if (now - st.mtimeMs > ACTIVE_LOCK_STALE_MS) {
+          await rm(path.join(this.activeDir, '.switch.lock'), { force: true });
+        }
+      } catch { /* 锁已消失：忽略 */ }
+    }
     for (const e of actEntries) {
       if (!e.isFile() || !e.name.endsWith('.json')) continue;
-      try {
-        const rec = JSON.parse(await readFile(path.join(this.activeDir, e.name), 'utf8'));
-        if (!rec || typeof rec.targetModel !== 'string' || typeof rec.version !== 'string') continue;
-        if (e.name !== encodeModel(rec.targetModel)) continue;
-        const meta = this.meta.get(rec.version);
-        if (!meta || meta.targetModel !== rec.targetModel) continue;
-        this.active.set(rec.targetModel, Object.freeze({
-          targetModel: rec.targetModel,
-          version: rec.version,
-          switchedAt: typeof rec.switchedAt === 'string' ? rec.switchedAt : '',
-        }));
-      } catch { /* 残缺映射文件：忽略 */ }
+      const rec = await this.#readActiveFile(path.join(this.activeDir, e.name));
+      if (rec) this.active.set(rec.targetModel, Object.freeze({ ...rec }));
     }
+  }
+
+  /**
+   * 从磁盘载入一个已发布版本到内存（发布件不可变，可安全缓存/懒加载）。
+   * 残缺/校验不过的目录返回 null 且不污染视图。
+   */
+  async #loadRelease(version) {
+    if (this.meta.has(version)) return this.meta.get(version);
+    try {
+      const dir = path.join(this.releasesDir, version);
+      const meta = JSON.parse(await readFile(path.join(dir, 'meta.json'), 'utf8'));
+      if (!meta || meta.version !== version || !HEX64.test(meta.sha256 || '')) return null;
+      await access(path.join(dir, 'artifact'));
+      const frozen = Object.freeze({ ...meta });
+      this.meta.set(version, frozen);
+      return frozen;
+    } catch { /* 残缺目录：忽略 */ return null; }
+  }
+
+  /**
+   * 读取并校验一个活动映射文件：结构、文件名与型号的对应、
+   * 目标发布件存在且型号一致（缺失时从磁盘懒加载发布元数据）。
+   * 任何不符都返回 null（孤儿/损坏记录绝不参与拼接响应）。
+   */
+  async #readActiveFile(file) {
+    let raw;
+    try {
+      raw = await readFile(file, 'utf8');
+    } catch { return null; }
+    let rec;
+    try {
+      rec = JSON.parse(raw);
+    } catch { return null; }
+    if (!rec || typeof rec.targetModel !== 'string' || typeof rec.version !== 'string') return null;
+    if (path.basename(file) !== encodeModel(rec.targetModel)) return null;
+    const meta = this.meta.get(rec.version) || await this.#loadRelease(rec.version);
+    if (!meta || meta.targetModel !== rec.targetModel) return null;
+    return {
+      targetModel: rec.targetModel,
+      version: rec.version,
+      switchedAt: typeof rec.switchedAt === 'string' ? rec.switchedAt : '',
+    };
   }
 
   list() {
@@ -108,6 +156,11 @@ export class FirmwareStore {
 
   get(version) {
     return this.meta.get(version) || null;
+  }
+
+  /** 按版本取发布件元数据；内存缺失时从共享磁盘懒加载（其他实例可能刚发布） */
+  async findRelease(version) {
+    return this.meta.get(version) || this.#loadRelease(version);
   }
 
   artifactPath(version) {
@@ -214,6 +267,24 @@ export class FirmwareStore {
     return this.active.get(targetModel) || null;
   }
 
+  /**
+   * 从共享磁盘重读某型号的活动映射并刷新本实例内存。
+   * 多实例共用 DATA_DIR 时，竞争的赢家可能在另一实例上落盘：
+   * 设备每次稳定取件前都以磁盘为准，确保所有实例立即收敛到唯一获胜版本，
+   * 不再继续提供本实例先前看到的旧活动版本。返回磁盘上的活动记录（无则 null）。
+   */
+  async refreshActiveFromDisk(targetModel) {
+    const file = path.join(this.activeDir, encodeModel(targetModel));
+    const rec = await this.#readActiveFile(file);
+    if (rec) {
+      this.active.set(targetModel, Object.freeze({ ...rec }));
+    } else {
+      // 映射文件不存在/损坏/孤儿：磁盘上没有有效活动版本，同步清空缓存
+      this.active.delete(targetModel);
+    }
+    return rec;
+  }
+
   /** 某型号当前活动发布件的不可变元数据；从未切换返回 null */
   getActiveMeta(targetModel) {
     const rec = this.active.get(targetModel);
@@ -225,52 +296,61 @@ export class FirmwareStore {
    * - 发布件不存在：RELEASE_NOT_FOUND(404)
    * - 发布件型号与目标型号不一致：MODEL_MISMATCH(409)
    * - expectedVersion 与切换前活动版本不符（首次切换须为 null）：VERSION_CONFLICT(409)
-   * 切换以“读旧映射 → 校验 → 原子替换文件 → 更新内存”为临界区，按型号串行，
-   * 因此并发竞争只有一个请求成功，其余拿到 409 且活动版本保持为最后一次成功切换。
+   * 临界区为“跨进程文件锁 → 以共享磁盘为准重读旧映射 → 校验 → 原子替换文件 →
+   * 更新内存”：同一 DATA_DIR 上的多个实例也只有一个能在旧版本上 CAS 成功，
+   * 竞争失败者拿到 409，活动版本保持为赢家版本，进程内再按型号串行排队。
    */
   async setActive(targetModel, releaseVersion, expectedVersion) {
     if (!targetModel || targetModel.length > 128) {
       throw new StoreError('targetModel 缺失或过长（最长 128）', 400, 'INVALID_TARGET_MODEL');
     }
     return this.#withActiveLock(targetModel, async () => {
-      const meta = this.meta.get(releaseVersion);
-      if (!meta) {
-        throw new StoreError(`发布版本 ${releaseVersion} 不存在`, 404, 'RELEASE_NOT_FOUND');
-      }
-      if (meta.targetModel !== targetModel) {
-        throw new StoreError(
-          `发布版本 ${releaseVersion} 的型号为 ${meta.targetModel}，无法切换到型号 ${targetModel}`,
-          409,
-          'MODEL_MISMATCH',
-        );
-      }
-      const current = this.active.get(targetModel) || null;
-      const currentVersion = current ? current.version : null;
-      if (expectedVersion !== currentVersion) {
-        throw new StoreError(
-          currentVersion === null
-            ? `型号 ${targetModel} 从未切换活动固件，expectedVersion 必须为 null`
-            : `前置版本不匹配：expectedVersion=${formatExpected(expectedVersion)}，当前活动版本为 ${currentVersion}`,
-          409,
-          'VERSION_CONFLICT',
-        );
-      }
+      await this.#acquireActiveLock();
+      try {
+        // 持锁期间没有任何实例能写活动目录；以共享磁盘上的映射为 CAS 旧值
+        const current = await this.refreshActiveFromDisk(targetModel);
+        const currentVersion = current ? current.version : null;
 
-      const record = {
-        targetModel,
-        version: releaseVersion,
-        switchedAt: new Date().toISOString(),
-      };
-      // 先写新映射文件再更新内存；原子 rename 保证重启后看到的是完整记录
-      const file = path.join(this.activeDir, encodeModel(targetModel));
-      await writeFileAtomic(file, JSON.stringify(record, null, 2) + '\n');
-      const frozen = Object.freeze({ ...record });
-      this.active.set(targetModel, frozen);
-      return frozen;
+        // 发布件不可变：内存缺失时从磁盘懒加载（其他实例可能刚发布）
+        const meta = this.meta.get(releaseVersion) || await this.#loadRelease(releaseVersion);
+        if (!meta) {
+          throw new StoreError(`发布版本 ${releaseVersion} 不存在`, 404, 'RELEASE_NOT_FOUND');
+        }
+        if (meta.targetModel !== targetModel) {
+          throw new StoreError(
+            `发布版本 ${releaseVersion} 的型号为 ${meta.targetModel}，无法切换到型号 ${targetModel}`,
+            409,
+            'MODEL_MISMATCH',
+          );
+        }
+        if (expectedVersion !== currentVersion) {
+          throw new StoreError(
+            currentVersion === null
+              ? `型号 ${targetModel} 从未切换活动固件，expectedVersion 必须为 null`
+              : `前置版本不匹配：expectedVersion=${formatExpected(expectedVersion)}，当前活动版本为 ${currentVersion}`,
+            409,
+            'VERSION_CONFLICT',
+          );
+        }
+
+        const record = {
+          targetModel,
+          version: releaseVersion,
+          switchedAt: new Date().toISOString(),
+        };
+        // 先写新映射文件再更新内存；原子 rename 保证任何实例/重启看到的都是完整记录
+        const file = path.join(this.activeDir, encodeModel(targetModel));
+        await writeFileAtomic(file, JSON.stringify(record, null, 2) + '\n');
+        const frozen = Object.freeze({ ...record });
+        this.active.set(targetModel, frozen);
+        return frozen;
+      } finally {
+        await this.#releaseActiveLock();
+      }
     });
   }
 
-  /** 按型号串行执行活动切换临界区 */
+  /** 按型号串行执行活动切换临界区（进程内公平排队，跨进程互斥见文件锁） */
   async #withActiveLock(targetModel, fn) {
     const prev = this.activeLocks.get(targetModel) || Promise.resolve();
     let release;
@@ -284,6 +364,79 @@ export class FirmwareStore {
       release();
     }
   }
+
+  /**
+   * 获取跨进程活动切换锁：在共享 active/ 目录中以 O_EXCL 创建锁文件。
+   * 同一进程的切换已由 #withActiveLock 串行，故此处至多一次未决获取；
+   * 等待者轮询，锁文件超过 ACTIVE_LOCK_STALE_MS 视为持锁进程崩溃并强制接管。
+   */
+  async #acquireActiveLock() {
+    const lockName = '.switch.lock';
+    const lockPath = path.join(this.activeDir, lockName);
+    const deadline = Date.now() + ACTIVE_LOCK_WAIT_MS;
+    let warnedStale = false;
+    for (;;) {
+      const token = `${this.instanceId}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+      let fh;
+      try {
+        fh = await open(lockPath, 'wx');
+        try {
+          await fh.writeFile(token, 'utf8');
+        } catch (writeErr) {
+          // 建锁成功但写令牌失败：删除空锁后上抛，避免留下立即被判陈旧的空锁
+          await rm(lockPath, { force: true }).catch(() => {});
+          throw writeErr;
+        }
+        this.crossProcLock = { name: lockName, token };
+        return;
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      } finally {
+        if (fh) await fh.close().catch(() => {});
+      }
+
+      // 锁被占用：检查是否为陈旧锁（持锁进程已死 / 临界区异常耗时）
+      let ageMs = null;
+      try {
+        const st = await stat(lockPath);
+        ageMs = Date.now() - st.mtimeMs;
+      } catch (err) {
+        if (err.code === 'ENOENT') continue; // 持锁者刚释放，立刻重试
+        throw err;
+      }
+      if (ageMs !== null && ageMs > ACTIVE_LOCK_STALE_MS) {
+        // rm 后由下一轮 O_EXCL 仲裁：无论多少等待者同时判定陈旧，都只有一个能建锁
+        if (!warnedStale) {
+          warnedStale = true;
+          console.warn(`[firmware] 活动切换锁已陈旧（${Math.round(ageMs)}ms），强制接管：${lockPath}`);
+          await rm(lockPath, { force: true }).catch(() => {});
+        }
+      } else {
+        // 观察到新鲜锁后复位：若新持锁者也崩溃，下一轮仍可正常接管
+        warnedStale = false;
+      }
+      if (Date.now() > deadline) {
+        throw new StoreError(
+          '活动固件切换锁在 30s 内不可用（共享存储可能不可达）',
+          503,
+          'ACTIVE_LOCK_BUSY',
+        );
+      }
+      await sleep(20 + Math.random() * 30);
+    }
+  }
+
+  /** 释放跨进程锁：只删除自己持有的锁（令牌不符则绝不动别人的锁） */
+  async #releaseActiveLock() {
+    const held = this.crossProcLock;
+    this.crossProcLock = null;
+    if (!held) return;
+    const lockPath = path.join(this.activeDir, held.name);
+    try {
+      const cur = await readFile(lockPath, 'utf8');
+      if (cur === held.token) await rm(lockPath, { force: true });
+    } catch { /* 锁文件缺失或已被陈旧接管：无需处理 */ }
+  }
 }
 
 async function writeFileAtomic(p, data) {
@@ -291,6 +444,8 @@ async function writeFileAtomic(p, data) {
   await writeFile(tmp, data, { encoding: 'utf8' });
   await rename(tmp, p);
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function pathExists(p) {
   try {
