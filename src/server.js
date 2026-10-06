@@ -157,8 +157,9 @@ export function createServer({ dataDir, maxUploadBytes }) {
   }
 
   async function handleReleaseArtifact(req, res, version) {
-    const meta = store.get(version);
-    if (!meta || !VERSION_RE.test(version)) {
+    // 发布可能由共享 DATA_DIR 的另一实例完成：内存未命中时从磁盘惰性加载
+    const meta = VERSION_RE.test(version) ? await store.getFresh(version) : null;
+    if (!meta) {
       sendError(res, 404, 'RELEASE_NOT_FOUND', `版本 ${version} 不存在`);
       return;
     }
@@ -166,9 +167,11 @@ export function createServer({ dataDir, maxUploadBytes }) {
   }
 
   async function handleActiveArtifact(req, res, targetModel) {
-    // 仅解析一次不可变发布件元数据：整个响应（头与字节）都锁定在该版本，
-    // 即便响应期间活动版本被切换，设备拿到的仍是最后一次成功切换时的完整发布件。
-    const meta = store.getActiveMeta(targetModel);
+    // 先对齐共享盘上的权威活动映射（多实例部署下竞争切换的获胜者由磁盘映射决定），
+    // 再锁定该版本的不可变发布件元数据：整个响应（头与字节）都来自同一版本，
+    // 响应期间发生切换不会拼接新旧版本；竞争结束后无论请求落到哪个实例，
+    // 稳定地址都解析到同一个获胜版本。
+    const meta = await store.getActiveMetaFresh(targetModel);
     if (!meta) {
       sendError(res, 404, 'ACTIVE_RELEASE_NOT_FOUND',
         `型号 ${targetModel} 尚无活动固件`);

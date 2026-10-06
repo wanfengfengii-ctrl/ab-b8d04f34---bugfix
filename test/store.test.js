@@ -270,3 +270,74 @@ test('活动映射经重启保持，且仍指向同一不可变发布件', async
   const onDisk = await readFile(s2.artifactPath('2.0.0'));
   assert.ok(onDisk.equals(d2));
 });
+
+test('跨实例竞争：两个存储实例共享 DATA_DIR，同一前置版本上至多一个切换成功', async () => {
+  // 模拟共享持久卷部署下的两个服务实例：各自的内存锁互不知晓，
+  // 统一比较并交换语义只能由共享盘上的文件锁与权威映射保证
+  const dataDir = path.join(root, 'active-xinstance');
+  const s1 = new FirmwareStore(dataDir);
+  await s1.init();
+  await publishRelease(s1, dataDir, 'v0', 'WT-X', Buffer.from('x-zero'));
+  await publishRelease(s1, dataDir, 'v1', 'WT-X', Buffer.from('x-one'));
+  await publishRelease(s1, dataDir, 'v2', 'WT-X', Buffer.from('x-two'));
+  await s1.setActive('WT-X', 'v0', null);
+
+  // 第二个实例加载同一 DATA_DIR（已含活动版本 v0）
+  const s2 = new FirmwareStore(dataDir);
+  await s2.init();
+  assert.equal(s2.getActive('WT-X').version, 'v0');
+
+  // 两个实例并发竞争：同一前置版本 v0，分别切向 v1 / v2
+  const results = await Promise.allSettled([
+    s1.setActive('WT-X', 'v1', 'v0'),
+    s2.setActive('WT-X', 'v2', 'v0'),
+  ]);
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+  assert.equal(fulfilled.length, 1, '跨实例竞争必须恰有一个成功');
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.status, 409);
+  assert.equal(rejected[0].reason.code, 'VERSION_CONFLICT');
+  const winner = fulfilled[0].value.version;
+  assert.ok(['v1', 'v2'].includes(winner));
+
+  // 竞争结束后两个实例的读取都解析到同一获胜版本
+  assert.equal((await s1.refreshActive('WT-X')).version, winner);
+  assert.equal((await s2.refreshActive('WT-X')).version, winner);
+  assert.equal((await s1.getActiveMetaFresh('WT-X')).version, winner);
+  assert.equal((await s2.getActiveMetaFresh('WT-X')).version, winner);
+
+  // 败者以过期前置版本重试仍 409，活动版本不变
+  await assert.rejects(
+    s2.setActive('WT-X', winner === 'v1' ? 'v2' : 'v1', 'v0'),
+    (err) => err.status === 409 && err.code === 'VERSION_CONFLICT',
+  );
+  assert.equal((await s1.refreshActive('WT-X')).version, winner);
+
+  // 以获胜版本为前置的正常切换跨实例成功，另一实例刷新后可见
+  const next = winner === 'v1' ? 'v2' : 'v1';
+  const rec = await s2.setActive('WT-X', next, winner);
+  assert.equal(rec.version, next);
+  assert.equal((await s1.refreshActive('WT-X')).version, next);
+});
+
+test('跨实例发布可见：经另一实例发布的版本可切换、可下载', async () => {
+  const dataDir = path.join(root, 'active-xpublish');
+  const s1 = new FirmwareStore(dataDir);
+  await s1.init();
+  const s2 = new FirmwareStore(dataDir);
+  await s2.init();
+
+  // 发布只经过 s1；s2 内存中没有该版本
+  const data = Buffer.from('published-via-s1');
+  await publishRelease(s1, dataDir, '1.0.0', 'WT-XP', data);
+  assert.equal(s2.get('1.0.0'), null);
+
+  // s2 惰性加载共享盘上的发布件元数据后可完成切换
+  const rec = await s2.setActive('WT-XP', '1.0.0', null);
+  assert.equal(rec.version, '1.0.0');
+  const meta = await s1.getActiveMetaFresh('WT-XP');
+  assert.equal(meta.sha256, sha(data));
+  const onDisk = await readFile(s1.artifactPath('1.0.0'));
+  assert.ok(onDisk.equals(data));
+});
